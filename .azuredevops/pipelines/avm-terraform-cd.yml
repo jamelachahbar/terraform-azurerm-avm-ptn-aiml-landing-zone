@@ -1,0 +1,161 @@
+---
+# Azure DevOps continuous delivery pipeline for this Azure Verified Module.
+#
+# It deploys one of the deployable configurations in this repository (by default
+# `examples/default`) with Terraform state in an Azure Storage account:
+#
+#   1. the `plan` stage produces a plan file and a readable plan summary; and
+#   2. the `apply` stage applies exactly that plan after the Azure DevOps
+#      environment checks and approvals pass.
+#
+# Authentication uses workload identity federation on the Azure Resource Manager
+# service connection, so no credential is stored in the pipeline.
+#
+# See .azuredevops/README.md for the required service connection, variable and
+# environment configuration.
+
+name: $(Build.DefinitionName)_$(Date:yyyyMMdd)$(Rev:.r)
+
+parameters:
+  - name: azureServiceConnection
+    displayName: Azure Resource Manager service connection (workload identity federation)
+    type: string
+    default: avm-terraform-cd
+
+  - name: environmentName
+    displayName: Azure DevOps environment gating the apply stage
+    type: string
+    default: aiml-landing-zone
+
+  - name: configurationDirectory
+    displayName: Terraform root directory to deploy
+    type: string
+    default: examples/default
+
+  - name: varFile
+    displayName: Optional -var-file passed to terraform plan
+    type: string
+    default: ''
+
+  - name: subscriptionId
+    displayName: Optional subscription override (defaults to the service connection subscription)
+    type: string
+    default: ''
+
+  - name: destroy
+    displayName: Plan and apply a destroy instead of a deployment
+    type: boolean
+    default: false
+
+  - name: variableGroups
+    displayName: Variable groups to link (for example TF_VAR_* inputs and backend settings)
+    type: object
+    default: []
+
+  - name: vmImage
+    displayName: Agent image
+    type: string
+    default: ubuntu-latest
+
+# Deployments are deliberately manual or scheduled rather than triggered by a
+# commit.
+trigger: none
+pr: none
+
+pool:
+  vmImage: ${{ parameters.vmImage }}
+
+variables:
+  # Defaults are declared before the linked groups so a variable group, or a
+  # variable set on the pipeline, overrides them.
+  - name: TF_IN_AUTOMATION
+    value: '1'
+  - name: ARM_USE_AZUREAD
+    value: 'true'
+  - name: backendResourceGroupName
+    value: ''
+  - name: backendStorageAccountName
+    value: ''
+  - name: backendContainerName
+    value: tfstate
+  - name: backendKey
+    value: aiml-landing-zone.tfstate
+  - ${{ each group in parameters.variableGroups }}:
+      - group: ${{ group }}
+
+stages:
+  - stage: plan
+    displayName: Plan
+    jobs:
+      - job: plan
+        displayName: Terraform plan
+        timeoutInMinutes: 120
+        steps:
+          - checkout: self
+            clean: true
+
+          - task: AzureCLI@2
+            displayName: Terraform plan
+            inputs:
+              azureSubscription: ${{ parameters.azureServiceConnection }}
+              addSpnToEnvironment: true
+              scriptType: pwsh
+              scriptLocation: inlineScript
+              inlineScript: |
+                $ErrorActionPreference = 'Stop'
+                $scripts = '$(Build.SourcesDirectory)/.azuredevops/pipelines/scripts'
+                & "$scripts/Set-AzureTerraformEnvironment.ps1" -SubscriptionId '${{ parameters.subscriptionId }}'
+                & "$scripts/Invoke-TerraformStage.ps1" `
+                    -Action 'plan' `
+                    -ConfigurationDirectory '$(Build.SourcesDirectory)/${{ parameters.configurationDirectory }}' `
+                    -PlanFile '$(Build.ArtifactStagingDirectory)/tfplan' `
+                    -VarFile '${{ parameters.varFile }}' `
+                    -Destroy:$${{ parameters.destroy }} `
+                    -BackendResourceGroupName '$(backendResourceGroupName)' `
+                    -BackendStorageAccountName '$(backendStorageAccountName)' `
+                    -BackendContainerName '$(backendContainerName)' `
+                    -BackendKey '$(backendKey)'
+
+          - publish: $(Build.ArtifactStagingDirectory)
+            artifact: terraform-plan
+            displayName: Publish plan
+
+  - stage: apply
+    displayName: Apply
+    dependsOn: plan
+    condition: succeeded()
+    jobs:
+      - deployment: apply
+        displayName: Terraform apply
+        environment: ${{ parameters.environmentName }}
+        timeoutInMinutes: 720
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - checkout: self
+                  clean: true
+
+                - download: current
+                  artifact: terraform-plan
+                  displayName: Download plan
+
+                - task: AzureCLI@2
+                  displayName: Terraform apply
+                  inputs:
+                    azureSubscription: ${{ parameters.azureServiceConnection }}
+                    addSpnToEnvironment: true
+                    scriptType: pwsh
+                    scriptLocation: inlineScript
+                    inlineScript: |
+                      $ErrorActionPreference = 'Stop'
+                      $scripts = '$(Build.SourcesDirectory)/.azuredevops/pipelines/scripts'
+                      & "$scripts/Set-AzureTerraformEnvironment.ps1" -SubscriptionId '${{ parameters.subscriptionId }}'
+                      & "$scripts/Invoke-TerraformStage.ps1" `
+                          -Action 'apply' `
+                          -ConfigurationDirectory '$(Build.SourcesDirectory)/${{ parameters.configurationDirectory }}' `
+                          -PlanFile '$(Pipeline.Workspace)/terraform-plan/tfplan' `
+                          -BackendResourceGroupName '$(backendResourceGroupName)' `
+                          -BackendStorageAccountName '$(backendStorageAccountName)' `
+                          -BackendContainerName '$(backendContainerName)' `
+                          -BackendKey '$(backendKey)'

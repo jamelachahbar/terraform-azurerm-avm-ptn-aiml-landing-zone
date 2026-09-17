@@ -1,0 +1,25 @@
+---
+# Runs an `avm` command that does not need Azure credentials, for example
+# provider-mocked unit tests.
+
+parameters:
+  - name: displayName
+    type: string
+
+  - name: arguments
+    displayName: Arguments appended to the `avm` command.
+    type: string
+
+  - name: environmentVariables
+    type: object
+    default: {}
+
+steps:
+  - pwsh: |
+      $ErrorActionPreference = 'Stop'
+      Import-Module Avm.Authoring
+      avm ${{ parameters.arguments }}
+    displayName: ${{ parameters.displayName }}
+    env:
+      ${{ each variable in parameters.environmentVariables }}:
+        ${{ variable.key }}: ${{ variable.value }}

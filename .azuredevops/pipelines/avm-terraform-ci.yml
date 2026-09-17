@@ -1,0 +1,264 @@
+---
+# Azure DevOps continuous integration pipeline for this Azure Verified Module.
+#
+# It is the Azure Pipelines equivalent of the governance-managed GitHub
+# workflow used by `.github/workflows/pr-check.yml`
+# (Azure/azure-verified-modules-tools/.github/workflows/terraform-module.yml)
+# and drives the same Avm.Authoring test tiers:
+#
+#   * `avm test unit`        - provider-mocked unit tests, no Azure access.
+#   * `avm pr-check`         - sync, format, transform, lint, policy, validate, docs.
+#   * `avm test integration` - real-Azure Terraform tests.
+#   * `avm test e2e`         - deploy, idempotency check and destroy every example.
+#
+# See .azuredevops/README.md for the required service connection, variable group
+# and approval configuration.
+
+name: $(Build.DefinitionName)_$(SourceBranchName)_$(Date:yyyyMMdd)$(Rev:.r)
+
+parameters:
+  - name: azureServiceConnection
+    displayName: Azure Resource Manager service connection (workload identity federation)
+    type: string
+    default: avm-terraform-ci
+
+  - name: variableGroups
+    displayName: Variable groups to link (for example TF_VAR_* inputs)
+    type: object
+    default: []
+
+  - name: vmImage
+    displayName: Agent image
+    type: string
+    default: ubuntu-latest
+
+  - name: avmAuthoringVersion
+    displayName: Avm.Authoring version or version range (empty installs the latest)
+    type: string
+    default: ''
+
+  - name: runUnitTests
+    displayName: Run unit tests
+    type: boolean
+    default: true
+
+  - name: runPrCheck
+    displayName: Run the PR check gate
+    type: boolean
+    default: true
+
+  - name: runIntegrationTests
+    displayName: Run integration tests
+    type: boolean
+    default: true
+
+  - name: runE2eTests
+    displayName: Run end-to-end example tests
+    type: boolean
+    default: true
+
+  - name: examples
+    displayName: Examples to run end to end (empty discovers every runnable example)
+    type: object
+    default: []
+
+trigger:
+  branches:
+    include:
+      - main
+
+pr:
+  branches:
+    include:
+      - main
+
+pool:
+  vmImage: ${{ parameters.vmImage }}
+
+variables:
+  # Defaults are declared before the linked groups so a variable group, or a
+  # variable set on the pipeline, overrides them.
+  - name: TF_IN_AUTOMATION
+    value: '1'
+  - name: TF_VAR_enable_telemetry
+    value: 'false'
+  - name: GITHUB_TOKEN
+    value: ''
+  - name: avmTestSubscriptionIds
+    value: ''
+  - ${{ each group in parameters.variableGroups }}:
+      - group: ${{ group }}
+
+stages:
+  - ${{ if or(parameters.runUnitTests, parameters.runPrCheck) }}:
+      - stage: validate
+        displayName: Validate
+        jobs:
+          - ${{ if parameters.runUnitTests }}:
+              - job: unit_tests
+                displayName: Unit tests
+                timeoutInMinutes: 60
+                steps:
+                  - checkout: self
+                    fetchDepth: 0
+                    clean: true
+
+                  - template: templates/install-avm-authoring.yml
+                    parameters:
+                      avmAuthoringVersion: ${{ parameters.avmAuthoringVersion }}
+
+                  - template: templates/run-avm-command.yml
+                    parameters:
+                      displayName: Run unit tests
+                      arguments: test unit
+                      environmentVariables:
+                        GITHUB_TOKEN: $(GITHUB_TOKEN)
+
+          - ${{ if parameters.runPrCheck }}:
+              - job: pr_check
+                displayName: PR check
+                # `avm pr-check` needs a clean worktree and the history that
+                # managed-file synchronization compares against.
+                timeoutInMinutes: 120
+                steps:
+                  - checkout: self
+                    fetchDepth: 0
+                    clean: true
+
+                  - template: templates/install-avm-authoring.yml
+                    parameters:
+                      avmAuthoringVersion: ${{ parameters.avmAuthoringVersion }}
+
+                  - template: templates/run-avm-command-azure.yml
+                    parameters:
+                      displayName: Run pr-check
+                      arguments: pr-check
+                      azureServiceConnection: ${{ parameters.azureServiceConnection }}
+                      environmentVariables:
+                        GITHUB_TOKEN: $(GITHUB_TOKEN)
+
+  - ${{ if or(parameters.runIntegrationTests, parameters.runE2eTests) }}:
+      - stage: azure_tests
+        displayName: Azure tests
+        ${{ if or(parameters.runUnitTests, parameters.runPrCheck) }}:
+          dependsOn: validate
+        ${{ else }}:
+          dependsOn: []
+        jobs:
+          - ${{ if parameters.runIntegrationTests }}:
+              - job: integration_tests
+                displayName: Integration tests
+                timeoutInMinutes: 180
+                steps:
+                  - checkout: self
+                    fetchDepth: 0
+                    clean: true
+
+                  - template: templates/install-avm-authoring.yml
+                    parameters:
+                      avmAuthoringVersion: ${{ parameters.avmAuthoringVersion }}
+
+                  - template: templates/run-avm-command-azure.yml
+                    parameters:
+                      displayName: Run integration tests
+                      arguments: test integration
+                      azureServiceConnection: ${{ parameters.azureServiceConnection }}
+                      environmentVariables:
+                        GITHUB_TOKEN: $(GITHUB_TOKEN)
+
+          - ${{ if parameters.runE2eTests }}:
+              - job: discover_examples
+                displayName: Discover e2e examples
+                timeoutInMinutes: 30
+                steps:
+                  - checkout: self
+                    fetchDepth: 0
+                    clean: true
+
+                  - template: templates/install-avm-authoring.yml
+                    parameters:
+                      avmAuthoringVersion: ${{ parameters.avmAuthoringVersion }}
+
+                  - pwsh: |
+                      $ErrorActionPreference = 'Stop'
+                      Import-Module Avm.Authoring
+
+                      $requested = @($env:AVM_E2E_EXAMPLES -split ',' | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | ForEach-Object { $_.Trim() })
+                      if ($requested.Count -gt 0) {
+                          $examples = $requested
+                          Write-Host "Using the requested example list: $($examples -join ', ')"
+                      }
+                      else {
+                          $listed = (avm test e2e --list | Out-String).Trim()
+                          if ([string]::IsNullOrWhiteSpace($listed)) { $listed = '[]' }
+                          $examples = @($listed | ConvertFrom-Json)
+                          Write-Host "Discovered $($examples.Count) runnable example(s): $($examples -join ', ')"
+                      }
+
+                      # Optional round robin so parallel legs do not all deploy into
+                      # the same subscription and collide on quota. Accepts a JSON
+                      # array of subscription ids or of { id, name } objects.
+                      $subscriptions = @()
+                      if (-not [string]::IsNullOrWhiteSpace($env:AVM_TEST_SUBSCRIPTION_IDS)) {
+                          $subscriptions = @($env:AVM_TEST_SUBSCRIPTION_IDS | ConvertFrom-Json | ForEach-Object {
+                                  if ($_ -is [string]) { $_ } else { [string] $_.id }
+                              } | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+                      }
+
+                      $matrix = [ordered] @{}
+                      for ($index = 0; $index -lt $examples.Count; $index++) {
+                          $example = [string] $examples[$index]
+                          $subscriptionId = ''
+                          if ($subscriptions.Count -gt 0) {
+                              $subscriptionId = $subscriptions[$index % $subscriptions.Count]
+                          }
+
+                          # Matrix leg names allow word characters only.
+                          $leg = $example -replace '[^A-Za-z0-9_]', '_'
+                          $matrix[$leg] = @{ example = $example; subscriptionId = $subscriptionId }
+                      }
+
+                      $hasExamples = $matrix.Count -gt 0
+                      if (-not $hasExamples) {
+                          # Azure Pipelines cannot expand an empty matrix, so publish
+                          # a placeholder leg that the job condition filters out.
+                          $matrix['no_examples'] = @{ example = ''; subscriptionId = '' }
+                      }
+
+                      $json = $matrix | ConvertTo-Json -Depth 5 -Compress
+                      Write-Host "##vso[task.setvariable variable=matrix;isOutput=true]$json"
+                      Write-Host "##vso[task.setvariable variable=hasExamples;isOutput=true]$($hasExamples.ToString().ToLowerInvariant())"
+                    displayName: List runnable examples
+                    name: list
+                    env:
+                      AVM_E2E_EXAMPLES: ${{ join(',', parameters.examples) }}
+                      AVM_TEST_SUBSCRIPTION_IDS: $(avmTestSubscriptionIds)
+                      GITHUB_TOKEN: $(GITHUB_TOKEN)
+
+              - job: e2e_tests
+                displayName: End-to-end tests
+                dependsOn: discover_examples
+                condition: and(succeeded(), eq(dependencies.discover_examples.outputs['list.hasExamples'], 'true'))
+                timeoutInMinutes: 360
+                strategy:
+                  # Every failing example must be reported and every deployed
+                  # example must be destroyed, so legs never fail fast.
+                  matrix: $[ dependencies.discover_examples.outputs['list.matrix'] ]
+                steps:
+                  - checkout: self
+                    fetchDepth: 0
+                    clean: true
+
+                  - template: templates/install-avm-authoring.yml
+                    parameters:
+                      avmAuthoringVersion: ${{ parameters.avmAuthoringVersion }}
+
+                  - template: templates/run-avm-command-azure.yml
+                    parameters:
+                      displayName: Run end-to-end tests
+                      arguments: test e2e --example $env:AVM_E2E_EXAMPLE
+                      azureServiceConnection: ${{ parameters.azureServiceConnection }}
+                      subscriptionId: $(subscriptionId)
+                      environmentVariables:
+                        AVM_E2E_EXAMPLE: $(example)
+                        GITHUB_TOKEN: $(GITHUB_TOKEN)

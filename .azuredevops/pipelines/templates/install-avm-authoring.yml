@@ -1,0 +1,67 @@
+---
+# Installs the Avm.Authoring PowerShell module and prepares the AVM tool caches.
+#
+# Mirrors the "Configure AVM tool cache" and "Install Avm.Authoring" steps of the
+# governance-managed GitHub workflow
+# (Azure/azure-verified-modules-tools/.github/workflows/terraform-module.yml).
+
+parameters:
+  - name: avmAuthoringVersion
+    displayName: Optional Avm.Authoring version or version range.
+    type: string
+    default: ''
+
+steps:
+  - pwsh: |
+      $ErrorActionPreference = 'Stop'
+
+      $avmHome = Join-Path $env:AGENT_TEMPDIRECTORY 'avm-home'
+      $pluginCache = Join-Path $env:AGENT_TEMPDIRECTORY 'tf-plugin-cache'
+      New-Item -ItemType Directory -Force -Path $avmHome, $pluginCache | Out-Null
+
+      Write-Host "##vso[task.setvariable variable=AVM_HOME]$avmHome"
+      Write-Host "##vso[task.setvariable variable=TF_PLUGIN_CACHE_DIR]$pluginCache"
+    displayName: Configure AVM tool cache
+
+  - pwsh: |
+      $ErrorActionPreference = 'Stop'
+
+      if ($PSVersionTable.PSVersion -lt [version]'7.4') {
+          throw "Avm.Authoring requires PowerShell 7.4 or later, but the agent provides $($PSVersionTable.PSVersion). Use an agent image that ships pwsh 7.4+."
+      }
+
+      $params = @{
+          Name            = 'Avm.Authoring'
+          Scope           = 'CurrentUser'
+          TrustRepository = $true
+          ErrorAction     = 'Stop'
+      }
+      if (-not [string]::IsNullOrWhiteSpace($env:AVM_AUTHORING_VERSION)) {
+          $params['Version'] = $env:AVM_AUTHORING_VERSION
+      }
+
+      $maxAttempts = 3
+      for ($attempt = 1; $attempt -le $maxAttempts; $attempt++) {
+          try {
+              if (-not (Get-Module -ListAvailable -Name 'Microsoft.PowerShell.PSResourceGet')) {
+                  Install-Module -Name 'Microsoft.PowerShell.PSResourceGet' -Scope CurrentUser -Force -AllowClobber -ErrorAction Stop
+              }
+              Import-Module 'Microsoft.PowerShell.PSResourceGet'
+              Install-PSResource @params
+              break
+          }
+          catch {
+              if ($attempt -eq $maxAttempts) {
+                  throw
+              }
+              $delaySeconds = 5 * [math]::Pow(2, $attempt - 1)
+              Write-Warning "Avm.Authoring installation failed on attempt $attempt of ${maxAttempts}: $($_.Exception.Message). Retrying in $delaySeconds seconds."
+              Start-Sleep -Seconds $delaySeconds
+          }
+      }
+
+      Import-Module Avm.Authoring
+      avm version
+    displayName: Install Avm.Authoring
+    env:
+      AVM_AUTHORING_VERSION: ${{ parameters.avmAuthoringVersion }}

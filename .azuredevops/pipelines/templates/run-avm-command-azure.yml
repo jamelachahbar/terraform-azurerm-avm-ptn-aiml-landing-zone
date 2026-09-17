@@ -1,0 +1,45 @@
+---
+# Runs an `avm` command that needs Azure credentials - PR check policy
+# evaluation, integration tests and end-to-end example deployments.
+#
+# The command runs inside an AzureCLI@2 task so the Azure Resource Manager
+# service connection can hand a short-lived federated (OIDC) token to Terraform
+# without storing any secret in the pipeline.
+
+parameters:
+  - name: displayName
+    type: string
+
+  - name: arguments
+    displayName: Arguments appended to the `avm` command.
+    type: string
+
+  - name: azureServiceConnection
+    displayName: Azure Resource Manager service connection using workload identity federation.
+    type: string
+
+  - name: subscriptionId
+    displayName: Optional subscription override. Defaults to the service connection subscription.
+    type: string
+    default: ''
+
+  - name: environmentVariables
+    type: object
+    default: {}
+
+steps:
+  - task: AzureCLI@2
+    displayName: ${{ parameters.displayName }}
+    inputs:
+      azureSubscription: ${{ parameters.azureServiceConnection }}
+      addSpnToEnvironment: true
+      scriptType: pwsh
+      scriptLocation: inlineScript
+      inlineScript: |
+        $ErrorActionPreference = 'Stop'
+        & "$(Build.SourcesDirectory)/.azuredevops/pipelines/scripts/Set-AzureTerraformEnvironment.ps1" -SubscriptionId '${{ parameters.subscriptionId }}'
+        Import-Module Avm.Authoring
+        avm ${{ parameters.arguments }}
+    env:
+      ${{ each variable in parameters.environmentVariables }}:
+        ${{ variable.key }}: ${{ variable.value }}
